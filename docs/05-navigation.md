@@ -31,7 +31,7 @@ flowchart TB
 | **Extended Kalman filter** | Fuses the firmware's wheel odometry with the IMU at 30 Hz in planar mode, and is the sole owner of the odometry-to-robot transform. Which IMU fields are accepted and which are rejected is documented in its configuration. |
 | **slam_toolbox** | Builds maps on demand in asynchronous mode; in localisation mode it localises against a saved map. Either way it owns the map transform — which is why the two modes are mutually exclusive. |
 | **Nav2** | Global planner, an MPPI controller behind a rotation shim, recovery behaviours, a velocity smoother and a behaviour-tree navigator. Also supplies the measured drive/turn/spin behaviours the agent's relative-movement tools use. |
-| **Navigation bridge** | The single service surface for goals, maps and named areas, plus a rendered map view and a live status stream at 10 Hz. Everything above it — the web map page and the agent alike — speaks to this. |
+| **Navigation bridge** | The single service surface for goals, maps and named areas, plus a rendered map view and a live status stream at 10 Hz. Everything above it — the web app's Map view and the agent alike — speaks to this. |
 
 Mapping and navigating are **one service each and cannot coexist**: both would
 publish the same map transform, and two disagreeing estimates flipping many times
@@ -59,12 +59,61 @@ That one modelling choice is what makes natural-language navigation work.
 - **Areas know their own angle**, which is also what lets the map be drawn levelled
   to the building's walls rather than to the map frame's arbitrary axes.
 
-Named areas can be created from the phone (drag out a box on the map page) or by
+Named areas can be created from the phone (drag out a box on the Map view) or by
 asking the robot to name where it is standing.
 
 ---
 
-## 5.3 Multi-leg missions
+## 5.3 Knowing where it is
+
+slam_toolbox in localisation mode tracks the robot well from a good starting
+guess, but it cannot *find* the robot, and nothing it publishes says whether
+its answer is right. The map-to-odometry transform exists whether the pose is
+accurate or two rooms away, so a "pose valid" flag only ever meant "a transform
+exists". A robot that has been picked up and carried, or that started from a
+stale guess, would plan from the wrong room with complete confidence.
+
+So the navigation bridge answers the two questions that used to be left to the
+operator's eyes:
+
+| Question | How | Cost |
+|---|---|---|
+| **Check** — does the live scan fit the map at the pose we believe? | Score the scan at the current pose | A few milliseconds |
+| **Search** — where on the map does this scan fit? | Score candidate poses across the whole map, or one named room | About a second |
+
+Both score a scan the same way, against a **likelihood field**. Every map cell
+holds a value that falls off with distance to the nearest wall, and a pose's
+score is the mean value under the scan's endpoints. 1.0 is every laser return
+landing on a wall; a scan in the wrong room lands mostly on open floor and
+scores low. Unknown cells count half, so a scan that reaches past the mapped
+area is not scored as if it had hit something. Measured on this robot with a
+single scan: **0.98** at the true pose, **0.88** for the best wrong spot on the
+right map, and **0.73** for the best spot anywhere on the wrong map. The
+thresholds come from that, and are kept as parameters: one scan in one place
+is a start, not a calibration.
+
+How it is used:
+
+- **Continuously.** Once a second the live scan is scored at the current pose, and
+  the verdict — **ok**, **doubtful** or **lost** — is part of the navigation status.
+  The Map view shows it as a chip, and "where am I" mentions a doubt.
+- **Before every goal.** Every navigation goal, a tap on the Map view included,
+  runs the check first. A wrong pose is corrected before planning, and the goal is
+  refused if the robot is lost and cannot find itself.
+- **On request.** The `localize` tool and the agent's response to "you're lost" or
+  "I moved you" run the search. They can search one room when the person says
+  where the robot is, and they re-seed localisation **only on a confident,
+  unambiguous match**. Two places that fit equally well is an answer of "I'm not
+  sure", not a coin toss.
+- **Across restarts.** A pose that checks out is saved with the map, and navigation
+  starts localisation from it next time, so a robot that was switched off where
+  it stood comes up already knowing where it is.
+
+The Map view's "Set position" gesture remains for seeding localisation by hand.
+
+---
+
+## 5.4 Multi-leg missions
 
 The robot's goal interface is one-shot. Trips are made out of it by a mission
 runner in the agent:
@@ -117,7 +166,7 @@ teleoperation command cancels an active goal on the robot side.
 
 ---
 
-## 5.4 Relative movement, done properly
+## 5.5 Relative movement, done properly
 
 "Move forward one metre" used to mean publishing a fixed velocity for a number of
 seconds. Seconds are not metres on a tracked base: the tracks slip, the smoother
@@ -138,7 +187,7 @@ should stop about half a metre short and say why.
 
 ---
 
-## 5.5 Directions, remembered spots and the map picture
+## 5.6 Directions, remembered spots and the map picture
 
 | Capability | Behaviour |
 |---|---|
@@ -154,11 +203,11 @@ in should not show a confident position.
 
 ---
 
-## 5.6 Mapping from a phone
+## 5.7 Mapping from a phone
 
-The web map page runs the whole workflow without a terminal: **new map → drive
+The web app's Map view runs the whole workflow without a terminal: **new map → drive
 around → save map → navigate**. Those three actions switch the mapping and
-navigation services through the same allowlisted path the Services page uses. The
+navigation services through the same allowlisted path the Status view uses. The
 page also offers tap-to-navigate, tap-a-room-label to drive into it, drag-out to
 create a room, pan and pinch zoom, and a "set position" gesture — press where the
 robot really is and drag the way it faces — for seeding localisation.
@@ -166,9 +215,15 @@ robot really is and drag the way it faces — for seeding localisation.
 With nothing running it draws the saved map off disk and says so, because a
 picture the robot is not using should be labelled as one.
 
+<p align="center">
+  <img src="images/web-map.png" alt="The Map view: chips reading READY, Ground and Localised; the house's occupancy grid with labelled rooms including Kitchen, Living, Dining, Bedroom, Guest Bedroom and Dock; the robot drawn as a small green marker; Stop, Set position, + Area and Maps buttons" width="300">
+  <br>
+  <sub>The Map view. The chips show navigation state, the active map and the localisation verdict. Named rooms are drawn as rectangles levelled to the walls, and the robot is the small marker in the hallway. Tap a room label to drive into it.</sub>
+</p>
+
 ---
 
-## 5.7 Tuning a tracked base: what the robot taught
+## 5.8 Tuning a tracked base: what the robot taught
 
 Tracked chassis are not differential-drive textbook robots, and several
 navigation settings on Scout exist because of measured behaviour. These are

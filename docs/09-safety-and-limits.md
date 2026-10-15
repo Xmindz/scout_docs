@@ -37,6 +37,10 @@ flowchart TB
 | **Per-tool budgets and bounded turns** | A confused turn cannot drive a real machine around the house indefinitely, and ends with a spoken sentence rather than a framework error. |
 | **Refusals with reasons** | No goal when the robot does not know where it is; no goal on a map that is drawable but not navigable; no camera aim at an arbitrary target it cannot resolve. |
 | **Stop is never gated** | Stopping motion or stopping a follow takes no arguments, works from every state including "nothing is running", and is never held behind a confirmation. |
+| **Stop does not queue** | A bare "stop" — spoken, typed, or pressed into the phone — halts the wheels, cancels any goal and any follow from the caller's own thread, then ends the running turn at its next step. It never waits behind the mission it is meant to end. |
+| **Localisation is checked before driving** | Every navigation goal first scores the live laser scan against the map; a wrong pose is corrected, and a lost robot refuses the goal rather than planning from the wrong room. |
+| **Search approaches are guarded** | A search drives towards a find only with the body facing it and the camera centred, in short steps, and never more than 1 m. |
+| **Sleep never cuts work off** | Sleep is refused while the robot is navigating, mapping, tracking or following. |
 
 Two further principles apply to how the robot **reports**:
 
@@ -106,10 +110,12 @@ physical risk:
 
 ### Voice
 
-- **A spoken "stop" queues behind a running mission.** Turns are serialised and a
-  navigation goal blocks for minutes; pre-empting a running turn needs a
-  cancellation path that does not exist yet. Chat has the same limit; the on-screen
-  and physical overrides do not.
+- **Only a bare stop pre-empts.** "Stop" on its own ends a running turn at once;
+  "stop and go to the kitchen" is an ordinary command and queues behind it.
+- **Speech recognition needs the internet as deployed.** The on-device model is
+  switched off to keep the accelerator for vision, so without a connection the
+  robot cannot transcribe until it is switched back on. Malayalam has no offline
+  path at all.
 - **On-device transcription is materially less accurate** than the hosted option
   (16.7% versus 4.5% word error rate), and its failures change meaning rather than
   wording.
@@ -132,9 +138,18 @@ physical risk:
   view's encode.
 - Driving on-device speech recognition hard **costs detection frames**, because both
   share one accelerator.
+- **Faces are named only within about 2 m**, best within 1.5 m. Further away,
+  turned aside or looking down, a face is "too small" or "unknown", never a guess.
+- **The object finder is a hint, not a detector.** It misses things and marks
+  things that are not there, and its colour reading confuses brown with red and
+  orange, so every search photograph is still judged by a vision model.
+- **Photographs lag the camera by up to a second**, so searches wait for each
+  still to catch up; this is part of why a room search takes a minute or more.
+- **After waking from sleep**, the camera, detector and navigation take up to a
+  minute to come back.
 - A failed detection poll makes the topic **go quiet** rather than publish an empty
   list, so "not arriving" stays distinguishable from "nothing detected" — the
-  Services page surfaces this as a partial state.
+  Status view surfaces this as a partial state.
 
 ### Agent
 
@@ -146,6 +161,16 @@ physical risk:
   a separate, explicit action.
 - Answer quality depends on the configured model's tool-calling and vision ability;
   Scout is provider-agnostic, not provider-indifferent.
+- **A search reports gaps, not certainty.** Bearings it could not see — a blocked
+  turn, an unreachable viewpoint — are said as gaps, and "everywhere" is capped at
+  12 viewpoints and 10 minutes.
+- **Scheduled missions run with nobody watching**, through the same tools and
+  budgets as any other turn; a job missed by more than 10 minutes while the agent
+  was down is dropped and its owner told.
+- **Conversations roll over** after 10 minutes of quiet or 30 minutes of age, so a
+  reference to something said earlier than that is not understood.
+- **Home control reaches only what the household exposed** in the hub, and nothing
+  when the robot is off the home network.
 
 ### Security and operations
 
@@ -154,6 +179,11 @@ physical risk:
   bounded by an exact-string allowlist, so the worst it grants is disruption of
   known units — but that is a bound on one path, not a security model. Scout
   assumes a trusted home network.
+- **Anyone who can open the web app can call the robot and listen to the room.** A
+  ring announces every call and there is only one at a time, but it is not
+  prevented.
+- The web app's reboot and shut-down buttons are behind type-to-confirm, not
+  behind authentication.
 - The observability bridge, when running, permits publishing from any client on the
   network by default.
 - Mapping and navigating cannot run at once; switching to navigation discards an
@@ -165,9 +195,14 @@ physical risk:
 
 Recorded because a roadmap is more honest than a feature list:
 
-- **Pre-empting a running turn**, so a spoken "stop" does not queue behind a
-  mission.
 - **Speaking mission progress**, not only the final reply.
+- **Calibrating face-recognition thresholds** on this robot's own camera once more
+  people are enrolled; the current values come from the vendor's demonstration
+  footage.
+- **Tuning the object finder's thresholds** against real searches rather than a
+  handful of test photographs.
+- **Calibrating the localisation thresholds** beyond the single measured scan they
+  were set from.
 - **Streaming the model's own tokens into speech synthesis** sentence by sentence,
   cutting the remaining wait before the robot starts talking.
 - **Settling the camera tracking limit cycle**, via the flagged mount-calibration

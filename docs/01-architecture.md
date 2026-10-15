@@ -18,13 +18,21 @@ flowchart TB
         direction LR
         TGB["Telegram surface"]
         VOICE["Voice surface\nwake word · VAD · STT · TTS"]
-        GATE["Input gateway"]
+        WEBV["Phone push-to-talk\n+ live call"]
+        SCHED["Scheduler\ntimers · alarms · missions"]
+        GATE["Input gateway\nturn lock · stop pre-emption"]
         AGENT["Tool-calling agent\n+ middleware"]
         TOOLS["Tool suite"]
+        SLEEPM["Sleep manager"]
+        ACT["Activity log"]
         TGB --> GATE
         VOICE --> GATE
+        WEBV --> GATE
+        SCHED --> GATE
         GATE --> AGENT
+        GATE --> ACT
         AGENT <--> TOOLS
+        TOOLS --> SLEEPM
     end
 
     subgraph L2["Robot platform — scout_ws (ROS 2 Jazzy on the Pi)"]
@@ -38,15 +46,15 @@ flowchart TB
         FOLLOW["Person follower\n(wheels)"]
         PT["Camera-mount arbitration"]
         DET["Detection republisher"]
-        SVC["Service control"]
-        WEB["Web control pages"]
+        SVC["Service control\n+ reboot / shutdown"]
+        WEB["Web app\nDrive · Map · Activity · Status"]
     end
 
     subgraph L2H["Host-native helpers (Pi OS, outside the containers)"]
         direction LR
         MTX["Camera server\nWebRTC + loopback RTSP"]
         SNAP["Still-frame cache"]
-        NPU["NPU inference service\nobject detection + speech-to-text"]
+        NPU["NPU vision service\ndetection · stills · faces · finding\n(optional speech-to-text)"]
         SCTL["Privileged service endpoint"]
         UROS["micro-ROS serial agent"]
     end
@@ -74,9 +82,11 @@ flowchart TB
     TRACK --> PT
     DET --> TRACK
     NPU --> DET
-    MTX --> SNAP
+    NPU --> SNAP
+    MTX -. fallback .-> SNAP
     MTX --> NPU
     SNAP --> RB
+    TOOLS -->|faces, finding| NPU
     SVC --> SCTL
     WEB --> RB
     MUXV -->|velocity commands| UROS
@@ -91,10 +101,13 @@ flowchart TB
 
 **Conversation layer ([`scout_agent`](https://github.com/Xmindz/scout_agent)).**
 Everything to do with understanding a person and deciding what to do. It holds
-the language model, the tool definitions, the conversation memory and the entire
-voice pipeline. It speaks to the robot only through a WebSocket bridge, using the
-same public interfaces the web UI uses — no privileged access, no ROS
-installation of its own.
+the language model, the tool definitions, the conversation memory, the entire
+voice pipeline, the scheduler that acts when nobody is there, sleep mode, and
+the activity log. It speaks to the robot only through a WebSocket bridge, using
+the same public interfaces the web UI uses — no privileged access, no ROS
+installation of its own. The one exception is the robot's NPU vision service,
+which the agent calls directly over loopback HTTP for face recognition and
+object finding, the same way it once called on-device speech recognition.
 
 **Robot platform ([`scout_ws`](https://github.com/Xmindz/scout_ws)).**
 Everything to do with sensing, estimating, mapping, planning and arbitrating.
@@ -145,23 +158,30 @@ inside the ROS 2 containers, and each case has a specific cause:
 
 - **The camera is opened exactly once.** The Pi 5's camera stack does not support
   a second concurrent open, so one native camera server owns the device. The live
-  WebRTC view, the still-frame service the agent photographs through, and the
-  object-detection pipeline all draw from that single already-open stream over a
-  loopback-only mux. Nothing else touches the camera.
+  WebRTC view and the NPU vision pipeline draw from that single already-open
+  stream over a loopback-only mux. Nothing else touches the camera.
+- **The stream is decoded once.** The vision pipeline already decodes the stream
+  to feed the accelerator, so it also splits off full-resolution stills from that
+  same decode. The still-frame service the agent photographs through takes its
+  frames from there, and only runs a decoder of its own while the vision
+  pipeline is down. Previously the Pi decoded the same stream twice, at about a
+  fifth of a core each.
 - **Neural-accelerator work runs on the host.** The NPU runtime's userspace
   driver has to match the kernel module bound to the device, which is cleanest
   against the host's own installation.
 - **One process owns the accelerator.** The accelerator is handed out as a single
   virtual device, and a second process asking for it is refused. Object
-  detection and speech-to-text therefore run *inside the same host process* and
-  time-share the device through the runtime's round-robin scheduler — the
-  detail that makes on-device speech recognition possible at all. See
-  [Voice interaction](03-voice.md) and [Perception](04-perception.md).
+  detection, face recognition, open-vocabulary object finding and (when enabled)
+  speech-to-text therefore all run *inside the same host process* and time-share
+  the device through the runtime's round-robin scheduler. Everything else,
+  including the agent, is an HTTP client of that process. See
+  [Perception](04-perception.md) and [Voice interaction](03-voice.md).
 - **Privileged operations go the long way round.** A browser cannot manage system
   services, and neither can a containerised process. So the chain runs browser →
   WebSocket bridge → a ROS node → a loopback HTTP endpoint on the host → an
   exact-string allowlist → the service manager. Nothing new is exposed to the
   network, and the privileged side accepts only known unit names and actions.
+  Rebooting and shutting down the Pi take the same path.
 - **Cross-container messaging is forced onto UDP.** The default ROS 2 middleware
   prefers shared memory between same-host participants, but separate containers
   do not share it. Discovery still succeeds while traffic silently disappears —
@@ -181,16 +201,23 @@ This has three consequences worth naming:
 
 1. **A scanner hiccup no longer costs the transform tree.** Sensors used to share
    a launch file with the things that depend on them; now a restart is scoped.
-2. **The robot can be reconfigured from a phone.** A Services page lists every
-   unit with independent run-now and start-at-boot controls, dependency warnings,
-   and type-to-confirm on the dangerous ones — because "stop the laser scanner"
-   is a single service action.
+2. **The robot can be reconfigured from a phone.** The web app's Status view
+   lists every unit with independent run-now and start-at-boot controls,
+   dependency warnings, and type-to-confirm on the dangerous ones — because "stop
+   the laser scanner" is a single service action.
 3. **The agent can bring up what it needs.** When a person asks for a
    navigation goal and navigation is not running, the agent starts it, waits, and
    says that it is waiting. Some units are explicitly protected from the agent:
    the serial bridge to the microcontroller (opening its port resets the board
    and drops motor state mid-motion) and the web/bridge stack (which hosts the
    very connection the agent is talking over).
+4. **The robot can sleep.** Sleep mode is nothing more than the agent stopping six
+   units through the same allowlisted path: navigation, the laser scanner, the
+   detection republisher, the NPU vision service, the still-frame service and the
+   camera server. Dependents stop first, and they start again in reverse order.
+   Sleep state belongs to the agent, so the web app asks the agent to sleep or
+   wake rather than switching those units itself. See
+   [The agent §2.12](02-ai-agent.md#212-sleep-mode).
 
 Mapping and navigating are also mutually exclusive, enforced by the service
 manager rather than by convention: both would publish the same map-to-odometry
@@ -213,13 +240,24 @@ roughly four tenths of a second after every input goes quiet — a closed tab, a
 locked phone, a dropped network — so the robot does not continue on a stale
 command. Nothing else is permitted to publish the final velocity topic.
 
-**The camera mount.** Operator teleoperation, the agent, and the person tracker
-all want to aim it. A mount multiplexer resolves them in that priority order,
-publishes on change rather than on a clock, and treats *idle as hold* — the
-camera stays where it was last put rather than recentring. The agent's priority
-window is time-bounded, which the agent's own tools account for: aiming the
-camera during a follow is permitted, and every reply says that the tracker is
-about to take the camera back.
+**The camera mount.** Operator teleoperation (dragging the live video in the
+web app), the agent, and the person tracker all want to aim it. A mount
+multiplexer resolves them in that priority order, publishes on change rather
+than on a clock, and treats *idle as hold* — the camera stays where it was last
+put rather than recentring. The agent's priority window is time-bounded, which
+the agent's own tools account for: aiming the camera during a follow is
+permitted, and every reply says that the tracker is about to take the camera
+back.
+
+One rule sits on top of the priority order: **a command that a higher-priority
+source has overridden is stale, however long its own window.** Without it, an
+agent aim from a few seconds earlier would reclaim the camera less than half a
+second after the operator lifted their finger, and the camera would snap back
+to a view the operator had just moved away from. A streaming source such as
+the tracker is unaffected, because its next message is newer than the
+operator's last. The agent is also told when the operator has aimed the camera
+by hand, so it does not bring the camera "home" from a position somebody
+chose deliberately.
 
 ---
 

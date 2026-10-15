@@ -140,7 +140,7 @@ are the kind of thing that costs a day to rediscover.
 Nominal figures: a 20 cm effective track separation, 45 mm drive wheels, and a
 maximum linear speed of about 0.52 m/s as commanded (measured slightly higher at
 full duty). Those numbers are what the navigation layer's tuning assumes — see
-[Navigation §5.7](05-navigation.md#57-tuning-a-tracked-base-what-the-robot-taught).
+[Navigation §5.8](05-navigation.md#58-tuning-a-tracked-base-what-the-robot-taught).
 
 ---
 

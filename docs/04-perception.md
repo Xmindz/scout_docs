@@ -3,26 +3,37 @@
 [← Back to index](../README.md) · [← 3. Voice](03-voice.md)
 
 Scout sees through one camera on a pan-tilt mount, and that single stream feeds
-four consumers at once: a live low-latency view in the browser, still photographs
-for the agent, neural-network object detection, and a person tracker that keeps
-somebody in frame. This guide covers how one camera serves all of them, what the
-accelerator does, and the deliberate difference between *watching* a person and
-*following* one.
+every consumer at once: a live low-latency view in the browser, still
+photographs for the agent, neural-network object detection, face recognition,
+and a person tracker that keeps somebody in frame. This guide covers how one
+camera serves all of them, what the accelerator does, and the deliberate
+difference between *watching* a person and *following* one.
+
+<p align="center">
+  <img src="images/web-drive.png" alt="The web app's Drive view: live camera with a blue box labelled 'couch 81% #72', a call button, and D-pad controls" width="300">
+  <br>
+  <sub>The Drive view. Detection boxes, with class, confidence and persistent track ID, are drawn on a canvas over the untouched live video. Dragging the video aims the camera.</sub>
+</p>
 
 ---
 
-## 4.1 One camera, four consumers
+## 4.1 One camera, one decode, many consumers
 
 ```mermaid
 flowchart LR
-    CAM["Pi Camera Module 3"] -->|opened exactly once| MTX["Camera server\nWebRTC + loopback RTSP"]
+    CAM["Pi Camera Module 3 Wide"] -->|opened exactly once| MTX["Camera server\nWebRTC + loopback RTSP"]
     MTX -->|WebRTC| BROWSER["Live view in the browser"]
-    MTX -->|loopback| SNAP["Still-frame cache"]
-    MTX -->|loopback| DETECT["Detection pipeline\nGStreamer + NPU"]
+    MTX -->|loopback| DECODE["NPU vision pipeline\none decode, split three ways"]
+    DECODE --> DETECT["Object detection\n8 fps, always on"]
+    DECODE --> STILLS["Stills\n2 fps, full resolution"]
+    DECODE --> FACES["Face recognition\n4 fps, only when asked"]
+    STILLS --> SNAP["Still-frame cache"]
+    MTX -.->|fallback, keyframes only| SNAP
     SNAP --> PIC["Photograph service\n→ agent and chat"]
     DETECT --> TOPIC["Detections\nboxes, classes, track ids"]
     TOPIC --> OVERLAY["Browser box overlay"]
     TOPIC --> TRACKER["Person tracker"]
+    FACES --> AGENT["Agent face tools\nand named-person search"]
 ```
 
 **The camera is opened exactly once.** The platform's camera stack does not
@@ -37,6 +48,20 @@ is held in memory, so a photograph request is answered immediately. An earlier
 design spawned a decoder per request, racing a full connection and decode against
 the camera server's own CPU-bound video encode — several seconds under load, and
 sometimes a timeout.
+
+**And they come from the decode that already exists.** The vision pipeline has to
+decode the stream to feed the accelerator anyway, so it splits that one decode
+into separate branches, each behind its own queue so none can stall another.
+One branch encodes full-resolution stills twice a second, for under 1% of a
+core. Before this, the still-frame service ran its own full decode all the
+time, and the Pi decoded the same stream twice at about a fifth of a core each.
+Stills older than 1.5 s are rejected, so a frame left over from before a
+pipeline restart is never served as current. If the vision pipeline stops (sleep
+mode, a fault, the Status page), the still-frame service starts its own decoder
+after 5 s. That decoder reads keyframes only: the camera sends one every 15
+frames, which is exactly two stills a second without decoding the frames in
+between. So photographs survive the detector going down, at the cost of about
+six seconds of "no frame yet".
 
 **Detection is capped below the stream rate.** Inference happens on the
 accelerator, but the pipeline still spends host CPU on decode and downscaling, so
@@ -64,32 +89,90 @@ ROS node and republished as a standard detection array topic.
 silicon and onboard memory, so it does not compete with the host's software video
 encode the way a CPU-only model would.
 
-**Sharing with speech.** The same host process also serves on-device speech
-recognition, because the accelerator is a single virtual device that only one
-process may hold. The two consumers time-share it through the runtime's
-round-robin scheduler, with matching scheduling and batch settings on both sides.
-The coupling is deliberately one-directional: speech never calls into detection,
-and every speech failure path degrades to "transcription unavailable" rather than
-taking the detection pipeline down. Measured costs are in
-[Voice interaction](03-voice.md#34-speech-recognition-on-device-with-a-hosted-option).
+**Sharing the accelerator.** The same host process also serves face recognition,
+open-vocabulary object finding and, when enabled, on-device speech recognition,
+because the accelerator is a single virtual device that only one process may
+hold. All of them time-share it through the runtime's round-robin scheduler.
+The coupling is deliberately one-directional: none of them calls into
+detection, and each one's failure paths degrade to "unavailable" rather than
+taking the detection pipeline down. On-device speech recognition is currently
+switched off so that the accelerator is kept for vision; its measured cost is
+in [Voice interaction](03-voice.md#34-speech-recognition-hosted-with-an-on-device-option).
 
 **A partial failure is visible.** If the accelerator side stops answering, the
 republisher goes quiet rather than publishing an empty list — "no detections
-arriving" and "nothing detected" are different facts. The Services page surfaces
+arriving" and "nothing detected" are different facts. The Status view surfaces
 that as a partial state rather than as healthy.
 
 ---
 
-## 4.3 How the agent sees
+## 4.3 Faces and open-vocabulary finding
 
-The agent has two distinct ways of looking, and they answer different questions:
+Two more vision capabilities run on the same accelerator, and both are switched
+on only when something asks for them.
+
+### Face recognition
+
+A face detector (SCRFD) and a face-embedding model (ArcFace, MobileFaceNet) run
+as a third branch off the shared decode. The branch sits behind a valve and
+costs nothing until it is opened. The first request opens it, and it closes
+about 20 s after the last one. Open, it adds about 5% of one core at four frames
+a second.
+
+- **Enrolment learns the one face in view** over a few seconds of samples, and
+  refuses a crowded frame or a face that already looks like somebody else.
+- **Matching needs both similarity and a lead.** A face is named only when it is
+  clearly closer to one person than to the runner-up; otherwise it is reported as
+  unsure.
+- **Range is the real limit.** With this wide lens at 1280×720, a face is about
+  78 px wide at 1 m and 39 px at 2 m. Below 40 px faces are never named or
+  enrolled, and the camera's low, upward view hurts too, so enrolment and
+  recognition work best within about 1.5 m.
+- **Nothing leaves the robot.** The gallery — one embedding set and one face crop
+  per enrolment — is stored on the Pi.
+
+The agent's face tools, and how a named-person search uses recognition, are in
+[The agent §2.14](02-ai-agent.md#214-knowing-people-by-face) and
+[§2.11](02-ai-agent.md#211-searching-for-people-and-things).
+
+### Finding any named object
+
+The always-on detector knows the 80 COCO classes. A search for "a red ball" or "a
+brown chair" needs more than that, so a separate **open-vocabulary finder**
+answers "where in this photograph could this be?" for any noun:
+
+1. **YOLO-World on the accelerator** (about 70 ms), with the COCO names as its
+   vocabulary and the query swapped into a few unused slots. The vocabulary has
+   to stay COCO-shaped for the 8-bit model to behave.
+2. **If that finds nothing**, the same network at full precision on the CPU (about
+   2 s), because the 8-bit build loses rarer prompts.
+3. **If the query names a colour**, CLIP on the accelerator ranks each candidate
+   box by colour (about 20 ms per box).
+
+The finder's boxes are **proposals, not verdicts**. Tested on the robot, it missed
+an office chair seen from knee height and marked a dark shape as a chair, and
+its colour check reads brown as red or orange about as often as brown. So the
+search sends every photograph to the vision judge anyway, and uses the finder
+only as a hint and for a tighter position when the two agree. The finder runs
+only when asked: it is several times the always-on detector's compute, and its
+models (about 400 MB of host memory) are loaded once at start-up, because
+loading them while serving stalled photographs for several seconds.
+
+---
+
+## 4.4 How the agent sees
+
+The agent has several distinct ways of looking, and they answer different
+questions:
 
 | Tool | Returns | Good for |
 |---|---|---|
 | `what_do_you_see` | The current detection list — classes and track IDs | "Is anyone there?", counting, presence |
 | `take_picture` | An actual photograph, sent to the person **and shown to the model** | "What's on the table?", "does the door look shut?", anything a label list cannot answer |
+| `recognize_faces` | Who is in view, by name, for faces close enough to read | "Who's there?", "is that Anu?" |
+| `search_for` | A whole-room search, with the best photograph, the find's direction, and any gaps in coverage | "Find my keys in the bedroom", "is anyone in the kitchen?" |
 
-The second is what makes Scout's perception feel open-ended. A detector knows
+The photograph is what makes Scout's perception feel open-ended. A detector knows
 about a fixed set of classes; a vision-capable model looking at the photograph can
 describe a room, read a note, or notice that something is out of place. The
 mechanics of keeping photographs in the model's view for the whole task — and the
@@ -106,10 +189,34 @@ not exist.
 
 ---
 
-## 4.4 Aiming the camera
+## 4.5 Aiming the camera
 
 The mount has three would-be owners — operator, agent, tracker — resolved by a
 priority multiplexer (see [Architecture](01-architecture.md#15-arbitration-who-gets-the-robot)).
+
+### By hand, from the phone
+
+On the Drive view, **dragging the live video aims the camera**: drag right and it
+turns right, drag up and it tilts up, at the speed of the drag. A double-tap
+recentres it, and a small indicator shows the aim within the mount's reach while
+dragging.
+
+- **A drag across the whole video turns the camera by about one frame's width**, so
+  the scene under the finger moves about as far as the finger did.
+- **Smooth, not twitchy.** Touch input is low-pass filtered over about 70 ms, and
+  the command is slew-limited to the mount's measured speed, so a flick never
+  lands as one lurch. Commands are sent at about 30 Hz, so the multiplexer's own
+  10 Hz tick always samples a fresh value.
+- **A tap is not a drag.** A finger has to travel a short distance first, so a tap
+  never takes the camera away from the tracker.
+- **No wind-up.** Each step is clamped to the mount's real reach, so dragging past
+  a stop responds instantly when the finger comes back.
+- **After release the page goes silent and the mount holds.** The agent is told the
+  operator aimed it, so the camera is not sent "home" from a position somebody
+  chose; that hold lasts until the agent itself next aims the camera.
+
+### By the agent
+
 The agent's own aiming tools are built around five decisions:
 
 - **One command is the whole move.** The agent's priority window expires after a
@@ -166,7 +273,7 @@ decision, and so is a wake word.
 
 ---
 
-## 4.5 Watching a person versus following one
+## 4.6 Watching a person versus following one
 
 Two things people ask for in almost the same words, kept deliberately distinct:
 

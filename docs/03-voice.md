@@ -4,12 +4,17 @@
 
 > "hey jarvis" … *(rising beep)* … "go to the kitchen"
 
-Scout's voice interface is a complete on-robot pipeline: a wake word detected
-locally, an endpointer that decides when the sentence finished, speech
-recognition on the robot's own neural accelerator, the agent, and a spoken reply
-synthesised on-device. It runs as two threads inside the same process as the
+Scout's voice interface is a complete pipeline: a wake word detected locally, an
+endpointer that decides when the sentence finished, speech recognition (hosted
+by default, or on the robot's own neural accelerator), the agent, and a spoken
+reply synthesised on-device. It runs as threads inside the same process as the
 agent, alongside the chat surface, and it can be turned off with a single
-setting without affecting chat.
+setting without affecting chat. It speaks English and Malayalam.
+
+Two more ways to talk reach the same pipeline from a phone: **push-to-talk** in
+the web app, which runs a turn in the same conversation as the wake word, and a
+**live call**, which lends the robot's microphone and speaker to the phone with
+no agent involved.
 
 ---
 
@@ -19,7 +24,7 @@ setting without affecting chat.
 flowchart LR
     MIC["Microphone array\n16 kHz mono channel"] --> WW["Wake word\nopenWakeWord"]
     WW --> VAD["Endpointing\nSilero VAD"]
-    VAD --> STT["Speech-to-text\non-device NPU or hosted"]
+    VAD --> STT["Speech-to-text\nhosted (default) or on-device NPU"]
     STT --> GW["Input gateway"]
     GW --> AGENT["Agent"]
     AGENT --> TTS["Speech synthesis\nPiper"]
@@ -93,29 +98,37 @@ End of speech to transcript is about **1.1 s** end to end.
 
 ---
 
-## 3.4 Speech recognition: on-device, with a hosted option
+## 3.4 Speech recognition: hosted, with an on-device option
 
 Two interchangeable transcribers sit behind one small interface — status, wait
 for ready, transcribe — and nothing above that interface knows which is in use.
 
-| | On-device (default) | Hosted |
+| | Hosted (what the robot runs) | On-device |
 |---|---|---|
-| Model | Whisper-base (74M) | Whisper-large-v3-turbo (809M) |
-| Where | Hailo-10H NPU, over loopback | Hosted API |
-| Word error rate | 16.7% | **4.5%** |
-| Median latency | 400 ms | **281 ms** |
-| Cost to detection frame rate | 7.67 fps (from 8.12 idle) | **none** |
-| Works offline | **yes** | no |
+| Model | Whisper-large-v3-turbo (809M) | Whisper-base (74M) |
+| Where | Hosted API (Groq) | Hailo-10H NPU, over loopback |
+| Word error rate | **4.5%** | 16.7% |
+| Median latency | **281 ms** | 400 ms |
+| Cost to detection frame rate | **none** | about 5% at a realistic duty cycle |
+| Works offline | no | **yes** |
 
 Measured on this robot across the agent's own command vocabulary. The on-device
 model's failures are not cosmetic — "start **trekking** the person", "drive
 **4-2** meters" — and each one is the robot doing the wrong thing or nothing.
 
-**Fallback is automatic and one-directional.** With the hosted path selected, a
-failed request — network down, key rejected, rate limited — is transcribed
-on-device instead. The on-device service is running either way, so the fallback
-costs nothing until it fires, and a failure degrades accuracy for one utterance
-rather than making the robot deaf.
+**The robot now runs hosted-only.** Since the start of October the NPU's speech
+model is switched off and the accelerator is kept for vision: object detection,
+face recognition and object finding (see [Perception](04-perception.md)). With
+it off, the on-device fallback is off too. Both are a setting and a restart
+away, with no code change.
+
+**When both are enabled, fallback is automatic and one-directional.** With the
+hosted path selected, a failed request — network down, key rejected, rate
+limited — is transcribed on-device instead. The on-device service runs either
+way, so the fallback costs nothing until it fires, and a failure degrades
+accuracy for one utterance rather than making the robot deaf. A sleeping robot
+has its vision service stopped, so an on-device transcription that fails while
+asleep wakes the robot, waits for the model, and tries once more.
 
 Three things the hosted path needs that the loopback path does not:
 
@@ -131,21 +144,32 @@ Three things the hosted path needs that the loopback path does not:
 - **Rate limits are respected.** Rate-limit responses are retried against the
   server's own stated delay rather than raised.
 
-### Sharing one accelerator with vision
+### Sharing one accelerator with vision (when on-device is enabled)
 
-On-device transcription runs **inside the object-detection process**, because the
+On-device transcription runs **inside the NPU vision process**, because the
 accelerator is handed out as a single virtual device and a second process asking
-for it is refused outright. Both consumers therefore share one device and the
+for it is refused outright. All consumers therefore share one device and the
 runtime's round-robin scheduler time-slices between them. The voice pipeline is
 an HTTP client of that endpoint and nothing more — no model, no accelerator
-handle of its own.
+handle of its own. The speech model now runs entirely on the NPU through the
+runtime's native speech-to-text interface. Compared with the earlier split
+pipeline it loads in 1.6 s instead of about 15, transcribes a 3 s clip in
+0.38 s instead of 1.22, and adds about 12 MB of host memory instead of about
+500.
 
 That sharing comes with a rule: **one clip per utterance, never streamed, and
 nothing retries on its own.** Detection frame rate falls measurably when
-transcription is driven hard (8.12 fps idle, 7.30 at one command every two
-seconds, 4.38 back-to-back), and a retry loop is the cheapest way to reach the
-bottom of that range. Wake hits with no speech behind them are dropped without
-sending anything at all.
+transcription is driven hard:
+
+| Speech load | Detection | Accelerator time on speech |
+|---|---|---|
+| none | 8.06 fps | 0% |
+| one command every 5 s (realistic) | 7.67 fps | 7.6% |
+| one command every 2 s (heavy) | 7.17 fps | 18.9% |
+| back-to-back (synthetic) | 2.36 fps | 98.9% |
+
+A retry loop is the cheapest way to reach the bottom of that table. Wake hits
+with no speech behind them are dropped without sending anything at all.
 
 The rule binds the on-device path only. On the hosted path the accelerator is not
 in the voice path, so detection keeps its full frame rate.
@@ -155,7 +179,10 @@ in the voice path, so detection keeps its full frame rate.
 ## 3.5 Spoken replies
 
 Replies are synthesised on-device with **Piper**, streamed, and played through the
-array's own speaker.
+array's own speaker. Any installed Piper voice can be chosen by asking ("switch
+to the lessac voice"). The choice is kept per language, so picking a different
+English voice leaves the Malayalam voice alone. Every voice is about the same
+size, so the choice is a matter of taste, not latency.
 
 | Measurement | Value |
 |---|---|
@@ -175,13 +202,15 @@ the robot's own wake word.
 
 ### Cue tones
 
-Three short tones carry the state of the pipeline without words:
+Short tones carry the state of the pipeline without words:
 
 | Cue | Sound | Meaning |
 |---|---|---|
 | Wake | rising two-tone | Wake word heard — say the command |
 | Acknowledge | short blip | Transcribed, the agent is working |
 | Cancel | falling two-tone | Nothing heard, not understood, or dropped |
+| Alarm | chime | A timer or alarm is going off; its label is spoken after it |
+| Call start / end | two-pair ring / falling three notes | A phone has connected to, or hung up on, the room |
 
 ---
 
@@ -198,6 +227,19 @@ No second wake word. This exists because the agent's policy already tells it to
 ask one short question rather than guess — and until follow-up listening existed,
 the robot stopped listening the instant it finished asking. A clarifying question
 that costs a wake word is worse than no question at all.
+
+**When it reopens is a setting with three modes.** Originally the agent had to
+call `listen_for_reply` explicitly, and in practice it rarely did: the model
+reliably ended a reply with a question but often forgot to call the tool first.
+So there are now three modes:
+
+| Mode | The microphone reopens… |
+|---|---|
+| `question` (default) | whenever the reply, as it will actually be spoken, ends in a question mark — or the agent called the tool |
+| `tool` | only when the agent called the tool (the original behaviour) |
+| `always` | after every spoken reply (what this robot runs, so a conversation flows without repeated wake words) |
+
+All three share the same chain cap and the same barge-in guard described below.
 
 The design constraints are interesting, and they are why the tool that requests
 it cannot do the listening itself:
@@ -272,11 +314,121 @@ An optional physical button starts the same capture without a wake word, for a
 room too loud for "hey jarvis". It is a single input pin on the host — explicitly
 not on the microcontroller, so that pressing it cannot depend on the motion
 firmware being alive — and it enters the pipeline at exactly the same point the
-wake word does, including the camera bearing.
+wake word does, including the camera bearing. On this robot it is fitted on
+the Pi header pin chosen because its neighbours are all harmless: a slipped lead
+cannot reach a 5 V pin.
 
 ---
 
-## 3.9 Measurements and known limits
+## 3.9 Two languages: English and Malayalam
+
+"Switch to Malayalam" — or, on Telegram, a `/language` command, which is the way
+back if recognition ever gets bad enough that the robot cannot hear "switch to
+English" — changes three things at once. Leaving any one of them behind makes
+the other two useless:
+
+| | English | Malayalam |
+|---|---|---|
+| Speech recogniser | Whisper | **Sarvam**, in code-mix mode |
+| Voice | an English Piper voice | a Malayalam Piper voice |
+| Agent instructions | answer in English | answer in Malayalam script, briefly |
+
+**Whisper cannot do Malayalam**, and not by a margin tuning would close. On clean
+synthetic Malayalam — the easiest audio the robot will ever get — the large
+hosted Whisper models returned broken words, Tamil script, Gurmukhi script or
+nothing. Sarvam transcribed the same sentence exactly. So Malayalam uses a
+different provider, not a different Whisper setting, and has no on-device
+fallback.
+
+**Code-mix mode is the important detail.** People in Kerala name rooms and objects
+in English, and the robot's places are stored in English. In code-mix mode,
+"kitchen-ലേക്ക് പോകൂ" keeps "kitchen" in Latin script, so it reaches navigation
+as "kitchen". The same mode means an English sentence spoken in Malayalam mode
+comes back as English, which is what makes "switch to English" work. Unlike the
+hosted Whisper model, Sarvam really does return an empty string for silence, so
+the silence blocklist is not applied there.
+
+**Refused rather than half-done.** Without a Sarvam key the robot refuses to switch,
+rather than switching into a language it cannot hear. The choice survives
+reboots, and at start-up it is restored only if the setup is still usable. The
+wake word and the language model are the same in both languages. Sarvam
+measured 0.46–0.80 s per short clip, and its 5 s timeout turns a rare hung
+request into a "didn't catch that" tone rather than a robot that stares.
+
+---
+
+## 3.10 Talking from a phone
+
+Every view of the web app has a microphone button. The first tap turns the
+phone's microphone on; after that, **hold to talk, release to send**.
+
+```mermaid
+flowchart LR
+    PM["Phone microphone\n16 kHz, small pieces"] -->|WebSocket bridge| BR["Agent's web-voice bridge\nbuffer until release"]
+    BR --> STT["Same transcriber\nas the array"]
+    STT --> GW["Input gateway\nsame conversation as 'hey jarvis'"]
+    GW --> TTS["Reply synthesised"]
+    TTS -->|WebSocket bridge| PS["Played on the phone"]
+```
+
+- **Push-to-talk needs no wake word and no endpointer.** The press and the release
+  are the endpoints. The page keeps about a third of a second from before the
+  press and a quarter of a second after the release, so a first word said as the
+  thumb lands, or a last word said as it lifts, is kept.
+- **The reply plays on the phone**, not on the robot's speaker, unless the agent
+  calls a tool whose job is to talk to the room. Each phone turn is marked as
+  coming from the phone, so the model knows the person may not be near the robot.
+- **No new server or certificate.** Audio rides the WebSocket bridge connection the
+  page already holds, at about 32 KB/s each way.
+- **One press at a time.** A press while the last one is still being answered is
+  refused with a sentence rather than queued. Pressing during the spoken reply
+  cuts it off, and a "stop" press pre-empts a running turn like any other stop.
+- Measured with a real 6 s recording: the transcript came back **0.64 s** after
+  release, and the first reply audio started **0.6 s** after the reply text.
+
+**Limits.** The page has to stay open with the screen on, because mobile browsers
+stop the microphone when the tab is hidden; the page holds a screen wake lock
+while the microphone is on. Some phones play replies through the earpiece rather
+than the loudspeaker while the microphone is open, which is the browser's
+choice.
+
+---
+
+## 3.11 Calling the robot
+
+The phone-shaped button on the Drive view's camera starts a **live two-way audio
+call**: the phone's microphone comes out of the robot's speaker, and the robot's
+microphone comes out of the phone, until either side hangs up. There is no agent
+in it — nothing is transcribed or answered. It is the robot's microphone and
+speaker, lent to a phone, alongside the live camera.
+
+- **Audio goes over WebRTC, through the same camera server**, as Opus in both
+  directions. Only call control (start, keep-alive, end) goes over the WebSocket
+  bridge. WebRTC brings the jitter buffer, loss concealment and echo cancellation
+  that a home-made audio stream would have had to rebuild.
+- **The microphone is shared, not reopened.** The array refuses a second reader,
+  so the voice listener feeds the call its own echo-cancelled frames. A tone
+  played into the call through the speaker barely registers on that channel,
+  so the caller does not hear themselves.
+- **The speaker belongs to the call for the whole call.** Wake words and the
+  push-to-wake button are ignored, and the speech tools refuse rather than wait.
+- **Privacy is stated, not hidden.** Anyone who can open the page on the home
+  network can listen through the robot; that is accepted for a trusted home
+  network. The room hears a ring when a call starts and a falling tone when it
+  ends, and there is only ever one call at a time.
+- **A page that disappears is hung up on** after 10 s without a keep-alive, and the
+  page hangs up itself when hidden or when it leaves the Drive view. The robot's
+  microphone is never left streaming to nobody in particular.
+- **Sleep:** a call wakes the robot, because the camera server is one of the units
+  sleep stops. Call keep-alives count as activity, and putting the robot to sleep
+  ends the call.
+- The robot's stream is readable about **0.4 s** after the call starts, and the
+  speaker side keeps its delay bounded by trimming any backlog rather than letting
+  it grow.
+
+---
+
+## 3.12 Measurements and known limits
 
 Taken on the loaded robot, with voice running inside the agent service:
 
@@ -290,10 +442,10 @@ Taken on the loaded robot, with voice running inside the agent service:
 
 **Known limits, stated rather than hidden:**
 
-- **A spoken "stop" queues behind a running mission.** Turns are serialised, and a
-  navigation goal blocks for minutes. Pre-empting a running turn needs a
-  cancellation path through the mission runner that does not exist yet. The chat
-  surface has the same limit; the physical and on-screen overrides do not.
+- **Only a bare "stop" pre-empts.** "Stop", "cancel", "never mind" and the like,
+  said on their own, halt the robot and end the running turn at once. Anything
+  longer ("stop and go to the kitchen") is an ordinary command and queues behind
+  the turn in progress.
 - **Small speech models are weak on proper nouns.** The wake word is consumed
   before transcription sees the command, so it does not matter here — but nothing
   downstream may rely on exact matching of rare words.
@@ -301,7 +453,11 @@ Taken on the loaded robot, with voice running inside the agent service:
 - **The acoustic path cannot be self-tested** by playing audio through the robot,
   precisely because the robot cannot hear itself.
 - **Mission progress is not spoken**, only the final reply. A two-minute drive is
-  silent until it finishes.
+  silent until it finishes. Telegram and the web app do show progress as text.
+- **Hosted recognition needs the network.** With the on-device model switched off
+  to keep the accelerator for vision, a robot with no internet connection cannot
+  transcribe speech until the on-device model is switched back on.
+- **Malayalam has no offline path at all**, because no on-device model handles it.
 
 ---
 
